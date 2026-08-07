@@ -1,0 +1,9 @@
+# 数据集（本地/网盘另行同步，不入库）
+dataset/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 编辑器
+.vscode/
