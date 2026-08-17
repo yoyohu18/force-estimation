@@ -27,13 +27,20 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from dataset import TRAIN_SPLIT, VAL_FILES, VAL_SPLIT, ForceWindowDataset
-from model import MLP, count_parameters, negative_fraction
+from model import LSTMModel, MLP, count_parameters, negative_fraction
 from modes import QUAD_STAND, QUAD_WALK, REDUCED
 
 
-def train_one_epoch(model, loader, loss_fn, optimizer, device):
+def train_one_epoch(model, loader, loss_fn, optimizer, device, clip=None):
+    """One pass over the training set. Returns (mean loss, mean gradient norm).
+
+    The gradient norm is worth watching on its own: a recurrent model that is
+    losing gradient across time steps shows up as a norm that decays toward
+    zero, and one that is exploding shows up as a norm that spikes before the
+    loss turns into nan.
+    """
     model.train()  # tells dropout/batchnorm to behave as in training
-    total, n = 0.0, 0
+    total, n, gnorm = 0.0, 0, 0.0
     for x, y in loader:
         x, y = x.to(device), y.to(device)
 
@@ -42,13 +49,17 @@ def train_one_epoch(model, loader, loss_fn, optimizer, device):
 
         optimizer.zero_grad()
         loss.backward()
+        # clip_grad_norm_ returns the norm *before* clipping, so it doubles as
+        # a measurement even when clip is large enough never to bite.
+        gnorm += float(torch.nn.utils.clip_grad_norm_(
+            model.parameters(), clip if clip else float("inf"))) * len(x)
         optimizer.step()
 
         # .item() pulls the scalar off the GPU and drops the graph with it;
         # accumulating `loss` itself would keep every batch's graph alive.
         total += loss.item() * len(x)
         n += len(x)
-    return total / n
+    return total / n, gnorm / n
 
 
 @torch.no_grad()  # no graph, no .grad — validation never updates anything
@@ -79,7 +90,7 @@ def evaluate(model, loader, device):
 
 def fit(model, train_loader, val_loaders, device, epochs=200, lr=1e-3,
         patience=20, ckpt="checkpoints/mlp.pt", stats=None, log_every=10,
-        monitor="quad"):
+        monitor="quad", logdir=None, clip=1.0, hparams=None, weight_decay=0.0):
     """Train until the monitored validation loss stops improving, keep the best weights.
 
     `monitor` matters more than it looks. Averaging four-legged and reduced-
@@ -88,7 +99,16 @@ def fit(model, train_loader, val_loaders, device, epochs=200, lr=1e-3,
     still falling, because the reduced split was diverging at the same time.
     """
     loss_fn = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # AdamW, not Adam(weight_decay=...): Adam folds the L2 term into the
+    # gradient, which then gets divided by sqrt(v), so parameters with a large
+    # gradient history end up decayed *less*. AdamW applies the decay straight
+    # to the weights instead, decoupled from the adaptive scaling.
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    writer = None
+    if logdir:
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(logdir)
 
     best = float("inf")
     best_epoch = -1
@@ -97,11 +117,23 @@ def fit(model, train_loader, val_loaders, device, epochs=200, lr=1e-3,
     t0 = time.perf_counter()
 
     for epoch in range(1, epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, loss_fn, optimizer, device)
+        train_loss, grad_norm = train_one_epoch(
+            model, train_loader, loss_fn, optimizer, device, clip)
         metrics = {name: evaluate(model, dl, device) for name, dl in val_loaders.items()}
         val_loss = metrics[monitor]["mse"]
         history.append({"epoch": epoch, "train": train_loss,
                         **{f"{k}_mse": v["mse"] for k, v in metrics.items()}})
+
+        if writer:
+            writer.add_scalar("mse/train", train_loss, epoch)
+            writer.add_scalar("grad_norm", grad_norm, epoch)
+            for name, m in metrics.items():
+                writer.add_scalar(f"mse/val_{name}", m["mse"], epoch)
+                writer.add_scalar(f"r2/val_{name}", m["r2"], epoch)
+            # the gap is the overfitting signal; logging it saves eyeballing two curves
+            writer.add_scalar("mse/val_over_train", metrics[monitor]["mse"] / train_loss, epoch)
+            for tag, param in model.named_parameters():
+                writer.add_histogram(f"weights/{tag}", param, epoch)
 
         if val_loss < best:
             best, best_epoch = val_loss, epoch
@@ -120,6 +152,12 @@ def fit(model, train_loader, val_loaders, device, epochs=200, lr=1e-3,
     model.load_state_dict(best_state)  # roll back to the best epoch, not the last
     print(f"\nbest epoch {best_epoch}  val MSE {best:.5f}   "
           f"({time.perf_counter() - t0:.1f}s)")
+
+    if writer:
+        # hparams turns every run into one row of a comparison table in the UI
+        writer.add_hparams(hparams or {}, {"hparam/best_val_mse": best,
+                                           "hparam/best_epoch": best_epoch})
+        writer.close()
 
     if ckpt:
         os.makedirs(os.path.dirname(ckpt), exist_ok=True)
@@ -171,6 +209,12 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--ckpt", default="checkpoints/mlp.pt")
     p.add_argument("--monitor", default="quad", choices=["quad", "reduced"])
+    p.add_argument("--model", default="mlp", choices=["mlp", "lstm"])
+    p.add_argument("--logdir", default=None,
+                   help="tensorboard run directory, e.g. runs/lstm_h64")
+    p.add_argument("--clip", type=float, default=1.0, help="grad-norm clip, 0 to disable")
+    p.add_argument("--weight-decay", type=float, default=0.0)
+    p.add_argument("--dropout", type=float, default=0.0)
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -183,13 +227,19 @@ if __name__ == "__main__":
     print(f"device {device}   train {len(train_loader.dataset)} windows   "
           + "   ".join(f"val/{k} {len(v.dataset)}" for k, v in val_loaders.items()))
 
-    model = MLP(history=args.history, hidden=args.hidden).to(device)
+    model = (MLP(history=args.history, hidden=args.hidden, dropout=args.dropout)
+             if args.model == "mlp"
+             else LSTMModel(hidden=args.hidden, dropout=args.dropout)).to(device)
     total, _ = count_parameters(model)
-    print(f"MLP hidden={args.hidden}  {total} parameters\n")
+    print(f"{args.model.upper()} hidden={args.hidden}  {total} parameters\n")
 
     fit(model, train_loader, val_loaders, device, epochs=args.epochs, lr=args.lr,
         patience=args.patience, ckpt=os.path.join(here, args.ckpt), stats=stats,
-        monitor=args.monitor)
+        monitor=args.monitor, logdir=args.logdir, clip=args.clip or None,
+        weight_decay=args.weight_decay,
+        hparams={"model": args.model, "hidden": args.hidden, "history": args.history,
+                 "lr": args.lr, "batch_size": args.batch_size, "seed": args.seed,
+                 "weight_decay": args.weight_decay, "dropout": args.dropout})
 
     print("\nfinal metrics on the best checkpoint:")
     for name, dl in val_loaders.items():

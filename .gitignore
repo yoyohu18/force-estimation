@@ -10,3 +10,6 @@ __pycache__/
 
 # 编辑器
 .vscode/
+
+# TensorBoard 运行记录（可由 train.py --logdir 重新生成）
+runs/

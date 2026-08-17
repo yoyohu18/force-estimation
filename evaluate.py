@@ -25,7 +25,7 @@ import numpy as np
 import torch
 
 from dataset import TRAIN_SPLIT, VAL_FILES, VAL_SPLIT, ForceWindowDataset
-from model import MLP
+from model import LSTMModel, MLP
 from modes import QUAD_STAND, QUAD_WALK, REDUCED, label_modes
 
 FEET = ["FR", "FL", "RR", "RL"]
@@ -148,6 +148,8 @@ if __name__ == "__main__":
     p.add_argument("--ckpt", default="checkpoints/mlp.pt")
     p.add_argument("--history", type=int, default=20)
     p.add_argument("--hidden", type=int, default=64)
+    p.add_argument("--model", default="mlp", choices=["mlp", "lstm"])
+    p.add_argument("--dropout", type=float, default=0.0)
     args = p.parse_args()
 
     import glob
@@ -169,7 +171,9 @@ if __name__ == "__main__":
                     train_files),
     }
 
-    model = MLP(history=args.history, hidden=args.hidden).to(device)
+    model = (MLP(history=args.history, hidden=args.hidden, dropout=args.dropout)
+             if args.model == "mlp"
+             else LSTMModel(hidden=args.hidden, dropout=args.dropout)).to(device)
     model.load_state_dict(ck["model"])
     print(f"checkpoint: epoch {ck['epoch']}   monitored val MSE {ck['val_mse']:.5f}")
 
@@ -178,4 +182,4 @@ if __name__ == "__main__":
         y, mask = targets_and_mask(ds, src)
         results[name] = report(name, predict(model, ds, device), y, mask)
 
-    plot(results, os.path.join(here, "dataset", "figures", "eval_mlp.png"))
+    plot(results, os.path.join(here, "dataset", "figures", f"eval_{args.model}_h{args.hidden}.png"))

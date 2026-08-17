@@ -25,17 +25,22 @@ import torch.nn as nn
 class MLP(nn.Module):
     """Flatten the window, one hidden layer, linear readout."""
 
-    def __init__(self, history=20, n_features=33, hidden=64, n_out=4):
+    def __init__(self, history=20, n_features=33, hidden=64, n_out=4, dropout=0.0):
         super().__init__()  # must come first: it sets up the module registry
         self.flatten = nn.Flatten()  # (B, T, F) -> (B, T*F), leaves dim 0 alone
         self.fc1 = nn.Linear(history * n_features, hidden)
         self.act = nn.ReLU()
+        # Dropout zeroes a random share of the hidden units each training step,
+        # so no single unit can carry a feature on its own. nn.Module.eval()
+        # turns it off, which is why validation must call model.eval().
+        self.drop = nn.Dropout(dropout)
         self.fc2 = nn.Linear(hidden, n_out)
 
     def forward(self, x):
         x = self.flatten(x)
         x = self.fc1(x)
         x = self.act(x)
+        x = self.drop(x)
         return self.fc2(x)
 
 
@@ -75,3 +80,37 @@ if __name__ == "__main__":
     print(f"\nno activation:  max|b(a(z)) - z @ (W2 W1)^T| = "
           f"{(stacked - collapsed).abs().max():.2e}")
     print("  two Linear layers really are one Linear layer -> ReLU is what buys depth")
+
+
+class LSTMModel(nn.Module):
+    """Read the window one frame at a time, predict from the final hidden state.
+
+    Two things this buys over flattening the window into an MLP:
+
+    Weight sharing. "How do I read one 33-dim frame" is learned once and
+    applied 20 times, so the input weights are 33-wide instead of 660-wide.
+
+    Order. A fixed permutation of the 20 frames can be absorbed into the MLP's
+    first weight matrix (W1 P is just another W1), so the MLP cannot tell frame
+    order at all. The recurrence can: h_t depends on h_{t-1}.
+
+    The cell state updates as c_t = f_t * c_{t-1} + i_t * c~_t — additively, with
+    no weight matrix multiplying c_{t-1}. That is what keeps the gradient alive
+    across 20 steps where a plain RNN, which multiplies by W_h every step, would
+    have it decay or explode geometrically.
+    """
+
+    def __init__(self, n_features=33, hidden=64, layers=1, n_out=4, dropout=0.0):
+        super().__init__()
+        # batch_first=True: (B, T, F). The default is (T, B, F), which silently
+        # treats the batch as time and produces plausible-looking nonsense.
+        self.lstm = nn.LSTM(n_features, hidden, layers, batch_first=True,
+                            dropout=dropout if layers > 1 else 0.0)
+        # nn.LSTM's own dropout only fires *between* stacked layers, so with
+        # layers=1 it does nothing at all. This one acts on the readout.
+        self.drop = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden, n_out)
+
+    def forward(self, x):
+        out, (h_n, c_n) = self.lstm(x)  # out (B, T, hidden), h_n (layers, B, hidden)
+        return self.fc(self.drop(out[:, -1]))  # last step has seen the whole window
